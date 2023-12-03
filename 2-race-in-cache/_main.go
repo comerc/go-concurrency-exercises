@@ -10,6 +10,7 @@ package main
 
 import (
 	"container/list"
+	"hash/fnv"
 	"sync"
 	"testing"
 )
@@ -28,57 +29,79 @@ type page struct {
 	Value string
 }
 
-// KeyStoreCache is a LRU cache for string key-value pairs
 type KeyStoreCache struct {
-	cacheLock sync.Mutex
+	shards []shard
+	load   func(string) string
+}
+
+type shard struct {
+	cacheLock sync.RWMutex
 	cache     map[string]*list.Element
 	pages     list.List
-	load      func(string) string
 }
 
-// New creates a new KeyStoreCache
 func New(load KeyStoreCacheLoader) *KeyStoreCache {
+	return NewKeyStoreCache(5, load)
+}
+
+func NewKeyStoreCache(numShards int, load KeyStoreCacheLoader) *KeyStoreCache {
+	shards := make([]shard, numShards)
+	for i := 0; i < numShards; i++ {
+		shards[i] = shard{
+			cacheLock: sync.RWMutex{},
+			cache:     make(map[string]*list.Element),
+		}
+	}
 	return &KeyStoreCache{
-		load:  load.Load,
-		cache: make(map[string]*list.Element),
+		shards: shards,
+		load:   load.Load,
 	}
 }
 
-// Get gets the key from cache, loads it from the source if needed
 func (k *KeyStoreCache) Get(key string) string {
-	k.cacheLock.Lock()
-	defer k.cacheLock.Unlock()
+	shardIndex := hash(key) % uint32(len(k.shards))
+	shard := &k.shards[shardIndex]
 
-	if e, ok := k.cache[key]; ok {
-		k.pages.MoveToFront(e)
-		return e.Value.(page).Value
+	shard.cacheLock.Lock()
+	defer shard.cacheLock.Unlock()
+
+	if e, ok := shard.cache[key]; ok {
+		shard.pages.MoveToFront(e)
+		return e.Value.(*page).Value
 	}
+
 	// Miss - load from database and save it in cache
-	p := page{key, k.load(key)}
+	p := page{Key: key, Value: k.load(key)}
+
 	// if cache is full remove the least used item
-	if len(k.cache) >= CacheSize {
-		end := k.pages.Back()
+	if len(shard.cache) >= CacheSize {
+		end := shard.pages.Back()
 		// remove from map
-		delete(k.cache, end.Value.(page).Key)
+		delete(shard.cache, end.Value.(*page).Key)
 		// remove from list
-		k.pages.Remove(end)
+		shard.pages.Remove(end)
 	}
-	k.pages.PushFront(p)
-	k.cache[key] = k.pages.Front()
+
+	// add new page to cache
+	elem := shard.pages.PushFront(&p)
+	shard.cache[key] = elem
+
 	return p.Value
+}
+
+func hash(s string) uint32 {
+	h := fnv.New32a()
+	h.Write([]byte(s))
+	return h.Sum32()
 }
 
 // Loader implements KeyStoreLoader
 type Loader struct {
-	// dbLock sync.Mutex
 	DB *MockDB
 }
 
 // Load gets the data from the database
 func (l *Loader) Load(key string) string {
-	// l.dbLock.Lock()
-	// defer l.dbLock.Unlock()
-
 	val, err := l.DB.Get(key)
 	if err != nil {
 		panic(err)
